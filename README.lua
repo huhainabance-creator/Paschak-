@@ -1066,7 +1066,7 @@ ScreenGui.Parent         = targetGuiParent
 
 local MainFrame = Instance.new("Frame")
 MainFrame.Name             = "MainFrame"
-MainFrame.Size             = UDim2.new(0, 520, 0, 0)
+MainFrame.Size             = UDim2.new(0, 520, 0.5, -300)
 MainFrame.Position         = UDim2.new(0.5, -260, 0, 100)
 MainFrame.BackgroundColor3 = Color3.fromRGB(23, 25, 31)
 MainFrame.BorderSizePixel  = 0
