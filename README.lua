@@ -1235,7 +1235,7 @@ end)
 local isMinimized = false
 MinBtn.MouseButton1Click:Connect(function()
     isMinimized = not isMinimized
-    local targetSize = isMinimized and UDim2.new(0, 520, 0, 42) or UDim2.new(0, 520, 0, 100)
+    local targetSize = isMinimized and UDim2.new(0, 520, 0, 42) or UDim2.new(0, 520, 0, 400)
     TweenService:Create(MainFrame, TweenInfo.new(0.25, Enum.EasingStyle.Quad), { Size = targetSize }):Play()
 end)
 
