@@ -1793,7 +1793,7 @@ task.spawn(function()
     end
 end)
 
-flySpeedSlider = createSlider(farmPage, "Автофарм", "Швидкість польоту", 50, 350, 5, _G.FlySpeed, function(val)
+flySpeedSlider = createSlider(farmPage, "Автофарм", "Швидкість польоту", 50, 1000, 5, _G.FlySpeed, function(val)
     _G.FlySpeed = val
 end)
 
