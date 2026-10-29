@@ -1,4 +1,4 @@
--- UA Killer Hub | YBA — Версія з виправленим ItemFarm та MonHub GUI
+-- UA Killer Hub | YBA — Версія з виправленим інвентарем, AutoSell та MonHub GUI
 print("[UA Killer Hub | Init] Початок запуску скрипта...")
 
 if not game:IsLoaded() then
@@ -14,6 +14,7 @@ local VirtualUser = game:GetService("VirtualUser")
 local VirtualInputManager = game:GetService("VirtualInputManager")
 local UserInputService = game:GetService("UserInputService")
 local HttpService = game:GetService("HttpService")
+local StarterGui = game:GetService("StarterGui")
 
 local player = Players.LocalPlayer
 while not player do
@@ -684,8 +685,50 @@ local EventCandies = {
     ["Blue Candy"]  = true, ["Red Candy"]    = true,
 }
 
-local sellQueue = {}
-local isBusy    = false
+local sellQueue          = {}
+local isBusy             = false
+local isEquippingForSale = false
+local unsellableItems    = {}
+local UNSELLABLE_COOLDOWN = 60
+
+local function ensureBackpackEnabled()
+    pcall(function()
+        StarterGui:SetCoreGuiEnabled(Enum.CoreGuiType.Backpack, true)
+    end)
+end
+
+local function getInventoryDiagnostic()
+    local bp = player:FindFirstChild("Backpack")
+    local char = player.Character
+    local bpCount = bp and #bp:GetChildren() or 0
+    local charTools = 0
+    if char then
+        for _, it in ipairs(char:GetChildren()) do
+            if it:IsA("Tool") then charTools = charTools + 1 end
+        end
+    end
+    local isEnabled = true
+    pcall(function()
+        isEnabled = StarterGui:GetCoreGuiEnabled(Enum.CoreGuiType.Backpack)
+    end)
+    return bpCount, charTools, isEnabled
+end
+
+local function isItemUnsellable(item)
+    if not item then return true end
+    local lastFail = unsellableItems[item]
+    if lastFail and (tick() - lastFail < UNSELLABLE_COOLDOWN) then
+        return true
+    end
+    return false
+end
+
+local function markItemUnsellable(item, reason)
+    if not item then return end
+    unsellableItems[item] = tick()
+    warn(string.format("[UA Killer Hub | AutoSell] Предмет [%s] позначено як непродаваний на %d с. Причина: %s",
+        item.Name, UNSELLABLE_COOLDOWN, tostring(reason)))
+end
 
 local function getMerchant()
     local d = ReplicatedStorage:FindFirstChild("Dialogue")
@@ -779,6 +822,7 @@ local function closeMerchantDialogue()
         task.wait(0.12)
         if gui:IsA("ScreenGui") and gui.Enabled then pcall(function() gui.Enabled = false end) end
     end
+    ensureBackpackEnabled()
 end
 
 local function sellSingleItem(item)
@@ -788,10 +832,16 @@ local function sellSingleItem(item)
     local merchant = getMerchant()
     if not hum or not remote or not merchant then return false, "MissingCharacterOrNPC" end
 
+    isEquippingForSale = true
     hum:EquipTool(item)
     local equipTimeout = tick() + 0.8
     while tick() < equipTimeout and item.Parent ~= char do task.wait(0.04) end
-    if item.Parent ~= char then return false, "EquipTimeout" end
+    isEquippingForSale = false
+
+    if item.Parent ~= char then
+        pcall(function() hum:UnequipTools() end)
+        return false, "EquipTimeout"
+    end
 
     task.wait(0.12)
     remote:FireServer("PromptTriggered", merchant)
@@ -819,300 +869,371 @@ local function sellSingleItem(item)
         remote:FireServer("EndDialogue", { Option = "Option1", Dialogue = "Dialogue3", NPC = "Merchant" })
         remote:FireServer("DialogueEnd",  { Option = "Option1", Dialogue = "Dialogue3", NPC = "Merchant" })
     end)
-
-    local finalCheckTimeout = tick() + 0.6
-    while tick() < finalCheckTimeout do
-        if isItemSold(item) then break end
-        task.wait(0.05)
-    end
+    task.wait(0.1)
 
     local sold = isItemSold(item)
-    if not sold and item.Parent == char then
+    if not sold then
         pcall(function() hum:UnequipTools() end)
     end
-    return sold, sold and "Success" or "ItemNotRemoved"
+    ensureBackpackEnabled()
+
+    return sold, sold and "Success" or "ItemStillExists"
 end
 
-local function findSellableItem()
-    local backpack = player:FindFirstChild("Backpack")
-    local char     = player.Character
-    if backpack then
-        for _, it in ipairs(backpack:GetChildren()) do
-            if it:IsA("Tool") and not DontSell[it.Name] and not isItemSold(it) then return it end
-        end
+local function sellSingleItemWithRetries(item, maxRetries)
+    maxRetries = maxRetries or 3
+    local lastError = "Unknown"
+    for attempt = 1, maxRetries do
+        if isItemSold(item) then return true, "Success" end
+        local ok, errStage = sellSingleItem(item)
+        if ok then return true, "Success" end
+        lastError = errStage
+        task.wait(0.2)
     end
-    if char then
-        for _, it in ipairs(char:GetChildren()) do
-            if it:IsA("Tool") and not DontSell[it.Name] and not isItemSold(it) then return it end
-        end
-    end
-    return nil
+
+    markItemUnsellable(item, lastError or "SellTimeout")
+    local _, _, hum = getCharacter()
+    if hum then pcall(function() hum:UnequipTools() end) end
+    ensureBackpackEnabled()
+
+    return false, lastError
 end
 
-local function processSellQueue()
-    if isBusy or not _G.AutoSell then return end
-    isBusy = true
-    task.spawn(function()
-        while _G.AutoSell do
-            local nextItem = findSellableItem()
-            if not nextItem then break end
-            local sold, reason = sellSingleItem(nextItem)
-            task.wait(0.1)
-            local remaining = findSellableItem()
-            if not remaining then
-                closeMerchantDialogue()
-                break
-            end
-        end
-        closeMerchantDialogue()
-        isBusy = false
-    end)
+local function isItemInQueue(item)
+    for _, q in ipairs(sellQueue) do if q == item then return true end end
+    return false
 end
 
 local function queueItemForSale(item)
-    if not _G.AutoSell or not item or DontSell[item.Name] then return end
-    if not isBusy then processSellQueue() end
+    if not item or not item:IsA("Tool") or DontSell[item.Name] then return end
+    if isItemSold(item) or isItemInQueue(item) or isItemUnsellable(item) then return end
+    table.insert(sellQueue, item)
 end
 
--- =======================================================
--- ХЕЛОВІН ІВЕНТ (АВТОЗДАЧА ЦУКЕРОК ТА ЗАКРИТТЯ ДІАЛОГУ)
--- =======================================================
-local function hasCandies()
+local function syncSellQueue()
     local backpack = player:FindFirstChild("Backpack")
-    local char     = player.Character
     if backpack then
-        for _, it in ipairs(backpack:GetChildren()) do
-            if it:IsA("Tool") and EventCandies[it.Name] then return true end
+        for _, item in ipairs(backpack:GetChildren()) do
+            if item:IsA("Tool") and not DontSell[item.Name] and not isItemUnsellable(item) then
+                queueItemForSale(item)
+            end
         end
     end
+    local char = player.Character
     if char then
-        for _, it in ipairs(char:GetChildren()) do
-            if it:IsA("Tool") and EventCandies[it.Name] then return true end
+        for _, item in ipairs(char:GetChildren()) do
+            if item:IsA("Tool") and not DontSell[item.Name] and not isItemUnsellable(item) then
+                queueItemForSale(item)
+            end
+        end
+    end
+end
+
+local function hasSellableItems()
+    local backpack = player:FindFirstChild("Backpack")
+    if backpack then
+        for _, item in ipairs(backpack:GetChildren()) do
+            if item:IsA("Tool") and not DontSell[item.Name] and not isItemUnsellable(item) then
+                return true
+            end
+        end
+    end
+    local char = player.Character
+    if char then
+        for _, item in ipairs(char:GetChildren()) do
+            if item:IsA("Tool") and not DontSell[item.Name] and not isItemUnsellable(item) then
+                return true
+            end
         end
     end
     return false
 end
 
+local backpackChildConn   = nil
+local characterChildConn  = nil
+
+local function setupBackpackListener(backpack)
+    if backpackChildConn then
+        pcall(function() backpackChildConn:Disconnect() end)
+        backpackChildConn = nil
+    end
+    if not backpack then return end
+    syncSellQueue()
+    backpackChildConn = backpack.ChildAdded:Connect(function(item)
+        task.wait(0.15)
+        if _G.AutoSell and item:IsA("Tool") and not DontSell[item.Name] and not isItemUnsellable(item) then
+            queueItemForSale(item)
+        end
+    end)
+end
+
+local function setupCharacterInventoryListener(char)
+    if characterChildConn then
+        pcall(function() characterChildConn:Disconnect() end)
+        characterChildConn = nil
+    end
+    if not char then return end
+    characterChildConn = char.ChildAdded:Connect(function(item)
+        if isEquippingForSale then return end
+        task.wait(0.15)
+        if _G.AutoSell and item:IsA("Tool") and not DontSell[item.Name] and not isItemUnsellable(item) then
+            queueItemForSale(item)
+        end
+    end)
+end
+
+player.ChildAdded:Connect(function(child)
+    if child.Name == "Backpack" then
+        setupBackpackListener(child)
+        ensureBackpackEnabled()
+    end
+end)
+if player:FindFirstChild("Backpack") then
+    setupBackpackListener(player.Backpack)
+    ensureBackpackEnabled()
+end
+
+local function countTotalCandies()
+    local backpack = player:FindFirstChild("Backpack")
+    if not backpack then return 0 end
+    local count = 0
+    for _, item in ipairs(backpack:GetChildren()) do
+        if item:IsA("Tool") and EventCandies[item.Name] then count += 1 end
+    end
+    return count
+end
+
+local function clickEventCandyOption()
+    local gui = getDialogueGui()
+    if not gui then return false end
+    for _, btn in ipairs(gui:GetDescendants()) do
+        if (btn:IsA("TextButton") or btn:IsA("ImageButton")) and isGuiElementVisible(btn) then
+            local txt = btn.Text or ""
+            local childText = btn:FindFirstChildOfClass("TextLabel")
+            if childText and childText.Text ~= "" then txt = childText.Text end
+            local lowerTxt = txt:lower()
+            if lowerTxt:find("turn in") or (lowerTxt:find("candy") and not lowerTxt:find("what do i do") and not lowerTxt:find("could you please")) then
+                pcall(function()
+                    if firesignal then firesignal(btn.MouseButton1Click) firesignal(btn.Activated)
+                    else btn.Activated:Fire() end
+                end)
+                return true
+            end
+        end
+    end
+    return false
+end
+
+-- Надійне визначення активного діалогового вікна Jack із перевіркою видимості
 local function findJackDialogue()
-    local pg = player:FindFirstChild("PlayerGui")
-    if not pg then return nil end
-    local candidates = {
-        pg:FindFirstChild("DialogueGui"),
-        pg:FindFirstChild("Dialogue"),
-        pg:FindFirstChild("DialogueBox"),
-        pg:FindFirstChild("HUD"),
-    }
-    for _, root in ipairs(candidates) do
-        if root then
-            for _, descendant in ipairs(root:GetDescendants()) do
-                if descendant:IsA("TextLabel") or descendant:IsA("TextButton") then
-                    local t = (descendant.Text or ""):lower()
-                    if t:find("cauldron specter") or t:find("jack") or t:find("candy") or t:find("candies") or t:find("points") or t:find("halloween") then
-                        return root
+    local gui = getDialogueGui()
+    if not gui then return nil end
+
+    local isGuiEnabled = (gui:IsA("ScreenGui") and gui.Enabled) or gui.Visible
+    if not isGuiEnabled then return nil end
+
+    local hasJack      = false
+    local hasPoints    = false
+    local continueElem = nil
+    local pointsElem   = nil
+    local dialogueBox  = nil
+    local anyButton    = nil
+
+    for _, desc in ipairs(gui:GetDescendants()) do
+        if desc:IsA("TextLabel") or desc:IsA("TextButton") then
+            if isGuiElementVisible(desc) then
+                local txt   = desc.Text or ""
+                local lower = txt:lower()
+
+                if lower:find("jack") or lower:find("cauldron specter") then
+                    hasJack = true
+                end
+                if lower:find("point") then
+                    hasPoints = true
+                    pointsElem = desc
+                    if desc.Parent and desc.Parent:IsA("GuiObject") and desc.Parent.AbsoluteSize.Y > 40 then
+                        dialogueBox = desc.Parent
                     end
                 end
-            end
-        end
-    end
-    return getDialogueGui()
-end
-
-local function clickJackDialogueButton(btn)
-    if not btn or not isGuiElementVisible(btn) then return false end
-    local clicked = false
-    pcall(function()
-        if firesignal then
-            firesignal(btn.MouseButton1Click)
-            firesignal(btn.MouseButton1Down)
-            firesignal(btn.MouseButton1Up)
-            firesignal(btn.Activated)
-            clicked = true
-        end
-    end)
-    pcall(function()
-        local pos = btn.AbsolutePosition + (btn.AbsoluteSize / 2)
-        VirtualInputManager:SendMouseButtonEvent(pos.X, pos.Y, 0, true, game, 1)
-        task.wait(0.04)
-        VirtualInputManager:SendMouseButtonEvent(pos.X, pos.Y, 0, false, game, 1)
-        clicked = true
-    end)
-    return clicked
-end
-
-local function clickContinueButton()
-    local dialogueGui = findJackDialogue()
-    if not dialogueGui then return false end
-    local clickedAny = false
-    for _, elem in ipairs(dialogueGui:GetDescendants()) do
-        if isGuiElementVisible(elem) then
-            local txt = ""
-            if elem:IsA("TextButton") or elem:IsA("TextLabel") then
-                txt = (elem.Text or ""):lower()
-            end
-            if txt:find("click to continue") or txt:find("continue") or txt:find("next") or txt:find("close") or txt:find("done") then
-                local targetBtn = elem:IsA("TextButton") and elem or elem:FindFirstAncestorWhichIsA("TextButton")
-                if targetBtn and isGuiElementVisible(targetBtn) then
-                    clickJackDialogueButton(targetBtn)
-                    clickedAny = true
-                else
-                    pcall(function()
-                        local pos = elem.AbsolutePosition + (elem.AbsoluteSize / 2)
-                        VirtualInputManager:SendMouseButtonEvent(pos.X, pos.Y, 0, true, game, 1)
-                        task.wait(0.03)
-                        VirtualInputManager:SendMouseButtonEvent(pos.X, pos.Y, 0, false, game, 1)
-                        clickedAny = true
-                    end)
+                if lower:find("click to continue") or lower:find("continue") then
+                    continueElem = desc
+                end
+                if desc:IsA("TextButton") then
+                    anyButton = desc
                 end
             end
         end
     end
 
-    if not clickedAny then
-        for _, boxName in ipairs({"DialogueBox", "Frame", "Container", "Background"}) do
-            local box = dialogueGui:FindFirstChild(boxName, true)
-            if box and box:IsA("GuiObject") and isGuiElementVisible(box) then
-                pcall(function()
-                    local pos = box.AbsolutePosition + (box.AbsoluteSize / 2)
-                    VirtualInputManager:SendMouseButtonEvent(pos.X, pos.Y, 0, true, game, 1)
-                    task.wait(0.03)
-                    VirtualInputManager:SendMouseButtonEvent(pos.X, pos.Y, 0, false, game, 1)
-                    clickedAny = true
-                end)
-                if clickedAny then break end
-            end
-        end
+    if hasPoints or continueElem or (hasJack and anyButton) then
+        return {
+            gui          = gui,
+            hasPoints    = hasPoints,
+            pointsElem   = pointsElem,
+            continueElem = continueElem,
+            dialogueBox  = dialogueBox,
+            anyButton    = anyButton,
+        }
     end
-    return clickedAny
+    return nil
 end
 
-local function closeEventDialogue()
-    local char   = player.Character
-    local remote = char and char:FindFirstChild("RemoteEvent")
+local function clickContinueButton(jackData)
     pcall(function()
-        if remote then
-            remote:FireServer("EndDialogue", { Option = "Option1", Dialogue = "Dialogue1", NPC = "Halloween Event" })
-            remote:FireServer("EndDialogue", { Option = "Option2", Dialogue = "Dialogue1", NPC = "Halloween Event" })
-            remote:FireServer("DialogueEnd",  { Option = "Option1", Dialogue = "Dialogue1", NPC = "Halloween Event" })
-            remote:FireServer("EndDialogue", { Option = "Option1", Dialogue = "Dialogue2", NPC = "Halloween Event" })
-            remote:FireServer("EndDialogue", { Option = "Option1", Dialogue = "Dialogue3", NPC = "Halloween Event" })
+        if not jackData then jackData = findJackDialogue() end
+        if not jackData then return end
+
+        local targetClickElem = jackData.continueElem or jackData.anyButton
+
+        if targetClickElem and isGuiElementVisible(targetClickElem) then
+            pcall(function()
+                if firesignal then
+                    firesignal(targetClickElem.MouseButton1Click)
+                    firesignal(targetClickElem.Activated)
+                end
+            end)
+            local pos = targetClickElem.AbsolutePosition + (targetClickElem.AbsoluteSize / 2)
+            VirtualInputManager:SendMouseButtonEvent(pos.X, pos.Y, 0, true, game, 0)
+            task.wait(0.04)
+            VirtualInputManager:SendMouseButtonEvent(pos.X, pos.Y, 0, false, game, 0)
+            return
+        end
+
+        local container = jackData.dialogueBox
+        if not container and jackData.pointsElem then
+            container = jackData.pointsElem.Parent
+        end
+
+        if container and container:IsA("GuiObject") and isGuiElementVisible(container) then
+            local pos  = container.AbsolutePosition
+            local size = container.AbsoluteSize
+            local clickX = pos.X + (size.X / 2)
+            local clickY = pos.Y + (size.Y * 0.3)
+
+            pcall(function()
+                if firesignal and container:IsA("TextButton") then
+                    firesignal(container.MouseButton1Click)
+                    firesignal(container.Activated)
+                end
+            end)
+
+            VirtualInputManager:SendMouseButtonEvent(clickX, clickY, 0, true, game, 0)
+            task.wait(0.04)
+            VirtualInputManager:SendMouseButtonEvent(clickX, clickY, 0, false, game, 0)
         end
     end)
-
-    local closeTimeout = tick() + 2.0
-    while tick() < closeTimeout do
-        local dGui = findJackDialogue()
-        if not dGui then break end
-        local foundVisible = false
-        for _, el in ipairs(dGui:GetDescendants()) do
-            if el:IsA("GuiObject") and isGuiElementVisible(el) then
-                foundVisible = true
-                break
-            end
-        end
-        if not foundVisible then break end
-
-        clickContinueButton()
-        task.wait(0.15)
-    end
-
-    local finalGui = findJackDialogue()
-    if finalGui and finalGui:IsA("ScreenGui") and finalGui.Enabled then
-        pcall(function() finalGui.Enabled = false end)
-    end
 end
 
 local function submitAllCandies()
     local char, _, hum = getCharacter()
     local remote   = char and char:FindFirstChild("RemoteEvent")
     local eventNPC = getEventNPC()
-    if not hum or not remote or not eventNPC then return false end
+    if not remote or not hum or not eventNPC then return false end
 
-    remote:FireServer("PromptTriggered", eventNPC)
-    task.wait(0.2)
-    remote:FireServer("DialogueType", { Option = "Option1", Dialogue = "Dialogue1", NPC = "Halloween Event" })
-    task.wait(0.2)
-    remote:FireServer("DialogueType", { Option = "Option1", Dialogue = "Dialogue2", NPC = "Halloween Event" })
-    task.wait(0.2)
+    local success = false
+    pcall(function()
+        print("[UA Killer Hub | Event] Взаємодія з Jack...")
+        remote:FireServer("PromptTriggered", eventNPC)
 
-    local waitTimeout = tick() + 2.0
-    while tick() < waitTimeout do
-        clickContinueButton()
-        task.wait(0.12)
-        local dGui = findJackDialogue()
-        if not dGui then break end
-    end
+        local optionFound   = false
+        local optionTimeout = tick() + 2.5
+        while tick() < optionTimeout and _G.AutoEventCandy do
+            if clickEventCandyOption() then optionFound = true break end
+            task.wait(0.15)
+        end
+        if not optionFound then
+            print("[UA Killer Hub | Event] Меню здачі цукерок не з'явилося.")
+            ensureBackpackEnabled()
+            return
+        end
 
-    closeEventDialogue()
-    return true
-end
+        print("[UA Killer Hub | Event] Очікування повідомлення про отримані очки...")
+        local pointsFound   = false
+        local jackData      = nil
+        local pointsTimeout = tick() + 4.0
+        while tick() < pointsTimeout and _G.AutoEventCandy do
+            jackData = findJackDialogue()
+            if jackData and jackData.hasPoints then
+                pointsFound = true
+                local msgText = jackData.pointsElem and jackData.pointsElem.Text or "Очки отримано"
+                print(string.format("[UA Killer Hub | Event] Отримано підтвердження: '%s'", msgText))
+                break
+            end
+            task.wait(0.15)
+        end
+        if not pointsFound or not jackData then
+            print("[UA Killer Hub | Event] Повідомлення про очки не з'явилося (таймаут).")
+            ensureBackpackEnabled()
+            return
+        end
 
-local function checkAndSubmitEventCandies()
-    if not _G.AutoEventCandy or isBusy then return end
-    if not hasCandies() then return end
-    isBusy = true
-    task.spawn(function()
-        submitAllCandies()
-        task.wait(0.2)
-        closeEventDialogue()
-        isBusy = false
+        task.wait(0.35)
+
+        clickContinueButton(jackData)
+
+        local closeTimeout = tick() + 2.0
+        local isClosed     = false
+        while tick() < closeTimeout do
+            task.wait(0.15)
+            if not findJackDialogue() then
+                isClosed = true
+                break
+            end
+        end
+
+        if isClosed then
+            print("[UA Killer Hub | Event] Діалог Jack успішно закрито!")
+            success = true
+        else
+            print("[UA Killer Hub | Event] Діалог ще відкритий, виконуємо повторний клік...")
+            local retryData = findJackDialogue()
+            if retryData then
+                clickContinueButton(retryData)
+                task.wait(0.3)
+                if not findJackDialogue() then
+                    print("[UA Killer Hub | Event] Діалог Jack успішно закрито після повторного кліку!")
+                    success = true
+                end
+            end
+        end
     end)
+    ensureBackpackEnabled()
+    return success
 end
 
--- =======================================================
--- ІНВЕНТАР ТА ФОНОВІ ПОТОКИ
--- =======================================================
-local function setupInventoryListeners()
-    local backpack = player:WaitForChild("Backpack", 5)
-    if backpack then
-        backpack.ChildAdded:Connect(function(item)
-            if item:IsA("Tool") then
-                task.wait(0.08)
-                if _G.AutoEventCandy and EventCandies[item.Name] then
-                    checkAndSubmitEventCandies()
-                elseif _G.AutoSell and not DontSell[item.Name] then
-                    queueItemForSale(item)
-                end
-            end
-        end)
-    end
-
-    player.CharacterAdded:Connect(function(newChar)
-        newChar.ChildAdded:Connect(function(item)
-            if item:IsA("Tool") then
-                task.wait(0.08)
-                if _G.AutoEventCandy and EventCandies[item.Name] then
-                    checkAndSubmitEventCandies()
-                elseif _G.AutoSell and not DontSell[item.Name] then
-                    queueItemForSale(item)
-                end
-            end
-        end)
-    end)
-
-    if player.Character then
-        player.Character.ChildAdded:Connect(function(item)
-            if item:IsA("Tool") then
-                task.wait(0.08)
-                if _G.AutoEventCandy and EventCandies[item.Name] then
-                    checkAndSubmitEventCandies()
-                elseif _G.AutoSell and not DontSell[item.Name] then
-                    queueItemForSale(item)
-                end
-            end
-        end)
-    end
-end
-setupInventoryListeners()
-
--- Anti-AFK
+-- Головний потік продажів та цукерок
 task.spawn(function()
     while true do
-        task.wait(180)
-        if _G.AntiAFK then
-            pcall(function()
-                VirtualUser:CaptureController()
-                VirtualUser:ClickButton2(Vector2.new(0, 0))
-            end)
+        task.wait(0.3)
+        if isBusy then continue end
+
+        if _G.AutoEventCandy and countTotalCandies() >= 10 then
+            isBusy = true
+            closeMerchantDialogue()
+            while countTotalCandies() > 0 and _G.AutoEventCandy do
+                submitAllCandies()
+                task.wait(0.5)
+            end
+            ensureBackpackEnabled()
+            isBusy = false
+            continue
+        end
+
+        if _G.AutoSell and (#sellQueue > 0 or hasSellableItems()) then
+            isBusy = true
+            syncSellQueue()
+            while _G.AutoSell and #sellQueue > 0 do
+                local item = table.remove(sellQueue, 1)
+                if item and not isItemSold(item) and not DontSell[item.Name] and not isItemUnsellable(item) then
+                    sellSingleItemWithRetries(item, 3)
+                    task.wait(0.15)
+                end
+            end
+            closeMerchantDialogue()
+            local _, _, hum = getCharacter()
+            if hum then pcall(function() hum:UnequipTools() end) end
+            ensureBackpackEnabled()
+            isBusy = false
         end
     end
 end)
@@ -1122,24 +1243,37 @@ local function applyJumpPower()
     if hum then hum.JumpPower = JP_Value end
 end
 
-local function checkExistingInventoryOnStart()
-    task.spawn(function()
-        task.wait(1.5)
-        if _G.AutoEventCandy and hasCandies() then
-            checkAndSubmitEventCandies()
-        end
-        local sellItem = findSellableItem()
-        if _G.AutoSell and sellItem then
-            queueItemForSale(sellItem)
-        end
-    end)
+player.CharacterAdded:Connect(function(newChar)
+    task.wait(0.5)
+    applyJumpPower()
+    setupCharacterInventoryListener(newChar)
+    ensureBackpackEnabled()
+end)
+
+if player.Character then
+    setupCharacterInventoryListener(player.Character)
+    ensureBackpackEnabled()
 end
+
+-- Сторожовий таймер (Watchdog) для перевірки та відновлення Backpack GUI
+task.spawn(function()
+    while true do
+        task.wait(2.5)
+        pcall(function()
+            local bpCount, charTools, isCoreBackpackEnabled = getInventoryDiagnostic()
+            if not isCoreBackpackEnabled and not isBusy then
+                print(string.format("[UA Killer Hub | Inventory] Відновлено вимкнений Hotbar (Backpack: %d tools, Char: %d tools)",
+                    bpCount, charTools))
+                ensureBackpackEnabled()
+            end
+        end)
+    end
+end)
 
 task.spawn(function()
     while task.wait(0.2) do applyJumpPower() end
 end)
 
--- Фоновий цикл оновлення ESP з очищенням пам'яті
 task.spawn(function()
     while true do
         task.wait(0.8)
@@ -1175,16 +1309,22 @@ local function getSafeGuiParent()
         end)
         if testOk then return core end
     end
-    local pgui = player:WaitForChild("PlayerGui", 5)
-    return pgui or player:FindFirstChildOfClass("PlayerGui")
+    return player:WaitForChild("PlayerGui", 5) or player:FindFirstChildOfClass("PlayerGui")
 end
 
 local targetGuiParent = getSafeGuiParent()
-print("[UA Killer Hub | GUI] Батьківський контейнер GUI: " .. tostring(targetGuiParent and targetGuiParent.Name))
+print("[UA Killer Hub | GUI] Контейнер GUI: " .. tostring(targetGuiParent and targetGuiParent.Name))
 
 pcall(function()
-    local old = targetGuiParent:FindFirstChild("UAKillerHub_GUI")
-    if old then old:Destroy() end
+    if targetGuiParent then
+        local old = targetGuiParent:FindFirstChild("UAKillerHub_GUI")
+        if old then old:Destroy() end
+    end
+    local pg = player:FindFirstChild("PlayerGui")
+    if pg then
+        local oldPg = pg:FindFirstChild("UAKillerHub_GUI")
+        if oldPg then oldPg:Destroy() end
+    end
 end)
 
 local ScreenGui = Instance.new("ScreenGui")
@@ -1793,7 +1933,7 @@ task.spawn(function()
     end
 end)
 
-flySpeedSlider = createSlider(farmPage, "Автофарм", "Швидкість польоту", 50, 1000, 5, _G.FlySpeed, function(val)
+flySpeedSlider = createSlider(farmPage, "Автофарм", "Швидкість польоту", 50, 350, 5, _G.FlySpeed, function(val)
     _G.FlySpeed = val
 end)
 
@@ -1848,7 +1988,7 @@ createSection(sellPage, "Магазин", "Автопродаж")
 autoSellToggle = createToggle(sellPage, "Магазин", "Увімкнути автопродаж", _G.AutoSell, function(value)
     manuallyChanged.AutoSell = true
     _G.AutoSell = value
-    if value then processSellQueue() end
+    if value then syncSellQueue() end
 end)
 
 createButton(sellPage, "Магазин", "Продати предмети зараз", function()
@@ -1856,7 +1996,7 @@ createButton(sellPage, "Магазин", "Продати предмети зар
         showNotification("Магазин", "Початок продажу предметів...", 2)
         local prev = _G.AutoSell
         _G.AutoSell = true
-        processSellQueue()
+        syncSellQueue()
         task.spawn(function()
             while isBusy do task.wait(0.2) end
             _G.AutoSell = prev
@@ -1879,7 +2019,17 @@ createSection(eventPage, "Івент", "Halloween Event")
 autoCandyToggle = createToggle(eventPage, "Івент", "Авто-здача конфет", _G.AutoEventCandy, function(value)
     manuallyChanged.AutoEventCandy = true
     _G.AutoEventCandy = value
-    if value then checkAndSubmitEventCandies() end
+    if value and countTotalCandies() > 0 then
+        task.spawn(function()
+            isBusy = true
+            while countTotalCandies() > 0 and _G.AutoEventCandy do
+                submitAllCandies()
+                task.wait(0.5)
+            end
+            ensureBackpackEnabled()
+            isBusy = false
+        end)
+    end
 end)
 
 createButton(eventPage, "Івент", "Здати всі цукерки зараз", function()
@@ -1889,7 +2039,7 @@ createButton(eventPage, "Івент", "Здати всі цукерки зара
             isBusy = true
             submitAllCandies()
             task.wait(0.2)
-            closeEventDialogue()
+            ensureBackpackEnabled()
             isBusy = false
             showNotification("Івент", "Здачу завершено!", 2)
         end)
@@ -2123,6 +2273,5 @@ if shouldAutoLoad then
     end)
 end
 
-checkExistingInventoryOnStart()
-print("[UA Killer Hub] Успішно запущено з покращеним ItemFarm та MonHub GUI!")
+print("[UA Killer Hub] Успішно запущено з виправленим інвентарем та MonHub GUI!")
 showNotification("UA Killer Hub", "Скрипт успішно запущено!", 3.5)
