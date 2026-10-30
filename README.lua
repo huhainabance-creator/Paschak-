@@ -1,4 +1,4 @@
--- UA Killer Hub | YBA — Версія з виправленим інвентарем, AutoSell та MonHub GUI
+-- UA Killer Hub | YBA — Версія з архітектурним виправленням інвентарю та діалогів
 print("[UA Killer Hub | Init] Початок запуску скрипта...")
 
 if not game:IsLoaded() then
@@ -358,23 +358,6 @@ local function getCharacter()
     return char, hrp, hum
 end
 
--- Відстеження респавну та життєвого циклу персонажа
-player.CharacterAdded:Connect(function(newChar)
-    print("[UA Killer Hub | Character] Завантажено нового персонажа: " .. tostring(newChar.Name))
-    cleanupFlight()
-    pcall(function()
-        for _, obj in ipairs(player:GetChildren()) do
-            if obj.Name == "YBA_VirtualCFrame" then obj:Destroy() end
-        end
-    end)
-    task.spawn(function()
-        local hrp = newChar:WaitForChild("HumanoidRootPart", 5)
-        if not hrp then
-            warn("[UA Killer Hub | Character] HumanoidRootPart не знайдено протягом 5 секунд після появи моделі.")
-        end
-    end)
-end)
-
 local function zeroHrpVelocity(hrp)
     if not hrp then return end
     pcall(function()
@@ -400,6 +383,23 @@ local function cleanupFlight()
         end
     end
 end
+
+-- Відстеження респавну та життєвого циклу персонажа
+player.CharacterAdded:Connect(function(newChar)
+    print("[UA Killer Hub | Character] Завантажено нового персонажа: " .. tostring(newChar.Name))
+    cleanupFlight()
+    pcall(function()
+        for _, obj in ipairs(player:GetChildren()) do
+            if obj.Name == "YBA_VirtualCFrame" then obj:Destroy() end
+        end
+    end)
+    task.spawn(function()
+        local hrp = newChar:WaitForChild("HumanoidRootPart", 5)
+        if not hrp then
+            warn("[UA Killer Hub | Character] HumanoidRootPart не знайдено протягом 5 секунд після появи моделі.")
+        end
+    end)
+end)
 
 local function stopFlight()
     cleanupFlight()
@@ -687,15 +687,10 @@ local EventCandies = {
 
 local sellQueue          = {}
 local isBusy             = false
+local isBusyStartedAt    = 0
 local isEquippingForSale = false
 local unsellableItems    = {}
 local UNSELLABLE_COOLDOWN = 60
-
-local function ensureBackpackEnabled()
-    pcall(function()
-        StarterGui:SetCoreGuiEnabled(Enum.CoreGuiType.Backpack, true)
-    end)
-end
 
 local function getInventoryDiagnostic()
     local bp = player:FindFirstChild("Backpack")
@@ -707,11 +702,35 @@ local function getInventoryDiagnostic()
             if it:IsA("Tool") then charTools = charTools + 1 end
         end
     end
-    local isEnabled = true
-    pcall(function()
-        isEnabled = StarterGui:GetCoreGuiEnabled(Enum.CoreGuiType.Backpack)
+    local isCoreEnabled = true
+    local getOk, getErr = pcall(function()
+        isCoreEnabled = StarterGui:GetCoreGuiEnabled(Enum.CoreGuiType.Backpack)
     end)
-    return bpCount, charTools, isEnabled
+    if not getOk then
+        warn("[UA Killer Hub | Diag] Помилка GetCoreGuiEnabled(Backpack): " .. tostring(getErr))
+    end
+
+    local dGui = player:FindFirstChild("PlayerGui")
+    local dGuiObj = dGui and (dGui:FindFirstChild("DialogueGui") or dGui:FindFirstChild("Dialogue") or dGui:FindFirstChild("DialogueBox"))
+    local dGuiActive = false
+    if dGuiObj then
+        dGuiActive = (dGuiObj:IsA("ScreenGui") and dGuiObj.Enabled) or dGuiObj.Visible
+    end
+
+    return bpCount, charTools, isCoreEnabled, dGuiActive, dGuiObj
+end
+
+local function ensureBackpackEnabled(forceLog)
+    local ok, err = pcall(function()
+        StarterGui:SetCoreGuiEnabled(Enum.CoreGuiType.Backpack, true)
+    end)
+    if not ok then
+        warn("[UA Killer Hub | Inventory] Помилка виклику SetCoreGuiEnabled(Backpack, true): " .. tostring(err))
+    elseif forceLog then
+        local bpCount, charTools, isCore = getInventoryDiagnostic()
+        print(string.format("[UA Killer Hub | Inventory] SetCoreGuiEnabled(Backpack, true) виконано | CoreEnabled: %s | Tools (BP: %d, Char: %d)",
+            tostring(isCore), bpCount, charTools))
+    end
 end
 
 local function isItemUnsellable(item)
@@ -796,16 +815,20 @@ end
 local function closeMerchantDialogue()
     local char   = player.Character
     local remote = char and char:FindFirstChild("RemoteEvent")
-    pcall(function()
+    local remoteOk, remoteErr = pcall(function()
         if remote then
             remote:FireServer("EndDialogue", { Option = "Option1", Dialogue = "Dialogue3", NPC = "Merchant" })
             remote:FireServer("DialogueEnd", { Option = "Option1", Dialogue = "Dialogue3", NPC = "Merchant" })
             remote:FireServer("EndDialogue", { Option = "Option2", Dialogue = "Dialogue1", NPC = "Merchant" })
         end
     end)
+    if not remoteOk then
+        warn("[UA Killer Hub | Merchant] Помилка відправки EndDialogue: " .. tostring(remoteErr))
+    end
+
     local gui = getDialogueGui()
     if gui then
-        pcall(function()
+        local btnOk, btnErr = pcall(function()
             for _, btn in ipairs(gui:GetDescendants()) do
                 if (btn:IsA("TextButton") or btn:IsA("ImageButton")) and isGuiElementVisible(btn) then
                     local txt = btn.Text or ""
@@ -819,10 +842,12 @@ local function closeMerchantDialogue()
                 end
             end
         end)
-        task.wait(0.12)
-        if gui:IsA("ScreenGui") and gui.Enabled then pcall(function() gui.Enabled = false end) end
+        if not btnOk then
+            warn("[UA Killer Hub | Merchant] Помилка кліку по кнопках виходу з діалогу: " .. tostring(btnErr))
+        end
+        task.wait(0.15)
     end
-    ensureBackpackEnabled()
+    ensureBackpackEnabled(false)
 end
 
 local function sellSingleItem(item)
@@ -1055,70 +1080,103 @@ local function findJackDialogue()
                         dialogueBox = desc.Parent
                     end
                 end
-                if lower:find("click to continue") or lower:find("continue") then
+                if lower:find("click to continue") or (lower:find("continue") and not lower:find("option")) then
                     continueElem = desc
-                end
-                if desc:IsA("TextButton") then
-                    anyButton = desc
                 end
             end
         end
+
+        if desc:IsA("GuiButton") and isGuiElementVisible(desc) then
+            anyButton = desc
+        end
+
+        if not dialogueBox and desc:IsA("Frame") and isGuiElementVisible(desc) and desc.AbsoluteSize.Y > 60 then
+            dialogueBox = desc
+        end
     end
 
-    if hasPoints or continueElem or (hasJack and anyButton) then
+    if (hasJack or hasPoints) and (pointsElem or continueElem or dialogueBox) then
         return {
             gui          = gui,
+            hasJack      = hasJack,
             hasPoints    = hasPoints,
-            pointsElem   = pointsElem,
             continueElem = continueElem,
-            dialogueBox  = dialogueBox,
+            pointsElem   = pointsElem,
+            dialogueBox  = dialogueBox or (pointsElem and pointsElem.Parent) or (continueElem and continueElem.Parent),
             anyButton    = anyButton,
         }
     end
     return nil
 end
 
+-- Автоматичне закриття діалогу через штатну взаємодію з інтерфейсом
 local function clickContinueButton(jackData)
+    if not jackData then return end
+
+    -- Повна діагностика знайдених елементів
+    print("[UA Killer Hub | Event] Діагностика GUI-елементів діалогу Jack:")
+    if jackData.pointsElem then
+        print(string.format("  • [PointsLabel] Class: %s | Name: '%s' | Text: '%s' | Pos: (%d, %d) | Size: (%d, %d)",
+            jackData.pointsElem.ClassName, jackData.pointsElem.Name, jackData.pointsElem.Text,
+            jackData.pointsElem.AbsolutePosition.X, jackData.pointsElem.AbsolutePosition.Y,
+            jackData.pointsElem.AbsoluteSize.X, jackData.pointsElem.AbsoluteSize.Y))
+    end
+    if jackData.continueElem then
+        print(string.format("  • [ContinueElem] Class: %s | Name: '%s' | Text: '%s' | Pos: (%d, %d) | Size: (%d, %d)",
+            jackData.continueElem.ClassName, jackData.continueElem.Name, jackData.continueElem.Text,
+            jackData.continueElem.AbsolutePosition.X, jackData.continueElem.AbsolutePosition.Y,
+            jackData.continueElem.AbsoluteSize.X, jackData.continueElem.AbsoluteSize.Y))
+    end
+    if jackData.dialogueBox then
+        print(string.format("  • [DialogueBox] Class: %s | Name: '%s' | Pos: (%d, %d) | Size: (%d, %d)",
+            jackData.dialogueBox.ClassName, jackData.dialogueBox.Name,
+            jackData.dialogueBox.AbsolutePosition.X, jackData.dialogueBox.AbsolutePosition.Y,
+            jackData.dialogueBox.AbsoluteSize.X, jackData.dialogueBox.AbsoluteSize.Y))
+    end
+    if jackData.anyButton then
+        print(string.format("  • [FoundButton] Class: %s | Name: '%s' | Text: '%s'",
+            jackData.anyButton.ClassName, jackData.anyButton.Name, tostring(jackData.anyButton.Text or "")))
+    end
+
     pcall(function()
-        if not jackData then jackData = findJackDialogue() end
-        if not jackData then return end
+        -- 1. Якщо елемент мітки чи її батьківський контейнер є кнопкою — викликаємо штатні сигнали
+        local targetBtn = (jackData.continueElem and jackData.continueElem:IsA("GuiButton") and jackData.continueElem)
+            or (jackData.continueElem and jackData.continueElem.Parent and jackData.continueElem.Parent:IsA("GuiButton") and jackData.continueElem.Parent)
+            or jackData.anyButton
 
-        local targetClickElem = jackData.continueElem or jackData.anyButton
-
-        if targetClickElem and isGuiElementVisible(targetClickElem) then
-            pcall(function()
-                if firesignal then
-                    firesignal(targetClickElem.MouseButton1Click)
-                    firesignal(targetClickElem.Activated)
-                end
-            end)
-            local pos = targetClickElem.AbsolutePosition + (targetClickElem.AbsoluteSize / 2)
-            VirtualInputManager:SendMouseButtonEvent(pos.X, pos.Y, 0, true, game, 0)
-            task.wait(0.04)
-            VirtualInputManager:SendMouseButtonEvent(pos.X, pos.Y, 0, false, game, 0)
-            return
+        if targetBtn then
+            print("[UA Killer Hub | Event] Виклик сигналу кнопки: " .. targetBtn.Name)
+            if firesignal then
+                firesignal(targetBtn.MouseButton1Click)
+                firesignal(targetBtn.Activated)
+            else
+                targetBtn.Activated:Fire()
+            end
         end
 
-        local container = jackData.dialogueBox
-        if not container and jackData.pointsElem then
-            container = jackData.pointsElem.Parent
+        -- 2. Штатний клік мишкою по центру чорного діалогового вікна (де розташований текст і де клікає гравець)
+        local targetBox = jackData.dialogueBox or (jackData.pointsElem and jackData.pointsElem.Parent) or jackData.pointsElem
+        if VirtualInputManager and targetBox and targetBox:IsA("GuiObject") then
+            local absPos = targetBox.AbsolutePosition
+            local absSize = targetBox.AbsoluteSize
+            local clickX = absPos.X + absSize.X / 2
+            local clickY = absPos.Y + absSize.Y / 2
+
+            print(string.format("[UA Killer Hub | Event] Клік мишкою по центру рамки діалогу: (%d, %d)", math.floor(clickX), math.floor(clickY)))
+            VirtualInputManager:SendMouseButtonEvent(clickX, clickY, 0, true, game, 0)
+            task.wait(0.08)
+            VirtualInputManager:SendMouseButtonEvent(clickX, clickY, 0, false, game, 0)
         end
 
-        if container and container:IsA("GuiObject") and isGuiElementVisible(container) then
-            local pos  = container.AbsolutePosition
-            local size = container.AbsoluteSize
-            local clickX = pos.X + (size.X / 2)
-            local clickY = pos.Y + (size.Y * 0.3)
-
-            pcall(function()
-                if firesignal and container:IsA("TextButton") then
-                    firesignal(container.MouseButton1Click)
-                    firesignal(container.Activated)
-                end
-            end)
+        -- 3. Додатковий клік по центру тексту Continue (якщо він окремий від головної рамки)
+        if VirtualInputManager and jackData.continueElem and jackData.continueElem:IsA("GuiObject") and jackData.continueElem ~= targetBox then
+            local absPos = jackData.continueElem.AbsolutePosition
+            local absSize = jackData.continueElem.AbsoluteSize
+            local clickX = absPos.X + absSize.X / 2
+            local clickY = absPos.Y + absSize.Y / 2
 
             VirtualInputManager:SendMouseButtonEvent(clickX, clickY, 0, true, game, 0)
-            task.wait(0.04)
+            task.wait(0.06)
             VirtualInputManager:SendMouseButtonEvent(clickX, clickY, 0, false, game, 0)
         end
     end)
@@ -1143,7 +1201,6 @@ local function submitAllCandies()
         end
         if not optionFound then
             print("[UA Killer Hub | Event] Меню здачі цукерок не з'явилося.")
-            ensureBackpackEnabled()
             return
         end
 
@@ -1163,14 +1220,15 @@ local function submitAllCandies()
         end
         if not pointsFound or not jackData then
             print("[UA Killer Hub | Event] Повідомлення про очки не з'явилося (таймаут).")
-            ensureBackpackEnabled()
             return
         end
 
         task.wait(0.35)
 
+        -- Спроба закриття через визначені елементи
         clickContinueButton(jackData)
 
+        -- Перевірка моменту закриття діалогу
         local closeTimeout = tick() + 2.0
         local isClosed     = false
         while tick() < closeTimeout do
@@ -1197,43 +1255,71 @@ local function submitAllCandies()
             end
         end
     end)
-    ensureBackpackEnabled()
     return success
 end
 
--- Головний потік продажів та цукерок
+-- Головний потік продажів та цукерок з повним захистом від зависання
 task.spawn(function()
     while true do
         task.wait(0.3)
-        if isBusy then continue end
+        if isBusy then
+            if isBusyStartedAt > 0 and (tick() - isBusyStartedAt > 20) then
+                warn(string.format("[UA Killer Hub | State] УВАГА: виявлено завислий стан isBusy = true (триває %.1fs). Примусове скидання!", tick() - isBusyStartedAt))
+                isBusy = false
+                isBusyStartedAt = 0
+                local _, _, hum = getCharacter()
+                if hum then pcall(function() hum:UnequipTools() end) end
+                closeMerchantDialogue()
+                ensureBackpackEnabled(true)
+            end
+            continue
+        end
 
         if _G.AutoEventCandy and countTotalCandies() >= 10 then
             isBusy = true
-            closeMerchantDialogue()
-            while countTotalCandies() > 0 and _G.AutoEventCandy do
-                submitAllCandies()
-                task.wait(0.5)
+            isBusyStartedAt = tick()
+            local ok, err = pcall(function()
+                closeMerchantDialogue()
+                local candyTimeout = tick() + 25
+                while countTotalCandies() > 0 and _G.AutoEventCandy and tick() < candyTimeout do
+                    submitAllCandies()
+                    task.wait(0.5)
+                end
+            end)
+            if not ok then
+                warn("[UA Killer Hub | Event] Помилка виконання циклу AutoEventCandy: " .. tostring(err))
             end
-            ensureBackpackEnabled()
+            local _, _, hum = getCharacter()
+            if hum then pcall(function() hum:UnequipTools() end) end
+            ensureBackpackEnabled(false)
             isBusy = false
+            isBusyStartedAt = 0
             continue
         end
 
         if _G.AutoSell and (#sellQueue > 0 or hasSellableItems()) then
             isBusy = true
-            syncSellQueue()
-            while _G.AutoSell and #sellQueue > 0 do
-                local item = table.remove(sellQueue, 1)
-                if item and not isItemSold(item) and not DontSell[item.Name] and not isItemUnsellable(item) then
-                    sellSingleItemWithRetries(item, 3)
-                    task.wait(0.15)
+            isBusyStartedAt = tick()
+            local ok, err = pcall(function()
+                syncSellQueue()
+                local sellTimeout = tick() + 30
+                while _G.AutoSell and #sellQueue > 0 and tick() < sellTimeout do
+                    local item = table.remove(sellQueue, 1)
+                    if item and not isItemSold(item) and not DontSell[item.Name] and not isItemUnsellable(item) then
+                        sellSingleItemWithRetries(item, 3)
+                        task.wait(0.15)
+                    end
                 end
+            end)
+            if not ok then
+                warn("[UA Killer Hub | AutoSell] Помилка виконання циклу AutoSell: " .. tostring(err))
             end
             closeMerchantDialogue()
             local _, _, hum = getCharacter()
             if hum then pcall(function() hum:UnequipTools() end) end
-            ensureBackpackEnabled()
+            ensureBackpackEnabled(false)
             isBusy = false
+            isBusyStartedAt = 0
         end
     end
 end)
@@ -1255,18 +1341,46 @@ if player.Character then
     ensureBackpackEnabled()
 end
 
--- Сторожовий таймер (Watchdog) для перевірки та відновлення Backpack GUI
+-- Сторожовий таймер (Watchdog) для перевірки та діагностики Backpack GUI
+local lastLoggedCoreState = nil
+local restoreAttempts = 0
+
 task.spawn(function()
     while true do
         task.wait(2.5)
-        pcall(function()
-            local bpCount, charTools, isCoreBackpackEnabled = getInventoryDiagnostic()
-            if not isCoreBackpackEnabled and not isBusy then
-                print(string.format("[UA Killer Hub | Inventory] Відновлено вимкнений Hotbar (Backpack: %d tools, Char: %d tools)",
-                    bpCount, charTools))
-                ensureBackpackEnabled()
+        local diagOk, diagErr = pcall(function()
+            local bpCount, charTools, isCoreBackpackEnabled, dGuiActive, dGuiObj = getInventoryDiagnostic()
+
+            -- Логуємо тільки зміну стану для запобігання спаму
+            if lastLoggedCoreState ~= isCoreBackpackEnabled then
+                lastLoggedCoreState = isCoreBackpackEnabled
+                print(string.format("[UA Killer Hub | Watchdog] Стан Backpack GUI: CoreEnabled=%s | isBusy=%s | DialogueActive=%s (Obj: %s) | Tools (Backpack: %d, Char: %d)",
+                    tostring(isCoreBackpackEnabled), tostring(isBusy), tostring(dGuiActive), tostring(dGuiObj and dGuiObj.Name or "None"), bpCount, charTools))
+            end
+
+            -- Якщо CoreEnabled == false і немає активного діалогу з NPC
+            if not isCoreBackpackEnabled and not dGuiActive then
+                if restoreAttempts < 3 then
+                    restoreAttempts = restoreAttempts + 1
+                    warn(string.format("[UA Killer Hub | Watchdog] CoreGuiType.Backpack вимкнено без активного діалогу! Спроба відновлення %d/3...", restoreAttempts))
+                    ensureBackpackEnabled(true)
+                end
+            elseif isCoreBackpackEnabled then
+                restoreAttempts = 0
+            end
+
+            -- Якщо персонаж тримає предмет, але жодна операція не виконується
+            if not isBusy and charTools > 0 and not _G.AutoSell and not _G.AutoEventCandy then
+                local _, _, hum = getCharacter()
+                if hum then
+                    pcall(function() hum:UnequipTools() end)
+                end
             end
         end)
+
+        if not diagOk then
+            warn("[UA Killer Hub | Watchdog] Помилка діагностичного циклу: " .. tostring(diagErr))
+        end
     end
 end)
 
